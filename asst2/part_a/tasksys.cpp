@@ -38,6 +38,7 @@ void TaskSystemSerial::sync() {
     return;
 }
 
+
 /*
  * ================================================================
  * Parallel Task System Implementation
