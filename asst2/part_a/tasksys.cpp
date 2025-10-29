@@ -197,7 +197,7 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
                 {
                     std::unique_lock<std::mutex> lock(this->cur_task_mutex);//上锁
                     this->condition.wait(lock,
-                        [this]{return this->stop || this->cur<=this->_num_total_tasks;});//任务执行完了休眠
+                        [this]{return this->stop || this->cur<=this->_num_total_tasks;});//线程池未停止运行且任务执行完就休眠
                     
                     if(this->cur>=this->_num_total_tasks && this->stop)//执行完且线程池停止
                     return;
