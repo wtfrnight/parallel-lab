@@ -2,6 +2,14 @@
 #define _ITASKSYS_H
 #include <vector>
 
+#include "itasksys.h"
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <queue>
+#include <iostream>
+
 typedef int TaskID;
 
 class IRunnable {
