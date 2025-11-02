@@ -3,6 +3,30 @@
 
 #include "itasksys.h"
 
+#include <vector>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <unordered_map>
+#include <unordered_set>
+
+class Information_table
+{
+private:
+    
+public:
+    IRunnable* _runnable;
+    int _num_total_tasks;
+    std::vector<TaskID> _deps;
+    std::atomic<int> dep_count;
+    std::atomic<bool> over;
+    std::atomic<int> cur_task;
+    std::atomic<int> remain_task;
+    Information_table(IRunnable* runnable, int num_total_tasks, const std::vector<TaskID>& deps);
+    ~Information_table();
+};
 /*
  * TaskSystemSerial: This class is the student's implementation of a
  * serial task execution engine.  See definition of ITaskSystem in
@@ -60,6 +84,16 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
  * itasksys.h for documentation of the ITaskSystem interface.
  */
 class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
+    private:
+        std::atomic<TaskID> cur_ID{0};//TASK的唯一命名
+        std::unordered_map<TaskID,Information_table*> map;
+        std::unordered_map<TaskID,std::unordered_set<TaskID>> dep_map;//依赖关系表，存储依赖当前TASK的其他任务
+        std::queue<TaskID> ready_task;
+        std::vector <std::thread> workers;//线程池
+        std::mutex _mutex;
+        std::condition_variable condition;
+        std::atomic<int> active_batch;
+        bool stop;
     public:
         TaskSystemParallelThreadPoolSleeping(int num_threads);
         ~TaskSystemParallelThreadPoolSleeping();
