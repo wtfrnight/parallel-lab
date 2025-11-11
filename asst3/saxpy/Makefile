@@ -1,52 +1,49 @@
-
 EXECUTABLE := cudaSaxpy
 
 CU_FILES   := saxpy.cu
-
-CU_DEPS    :=
-
 CC_FILES   := main.cpp
 
-###########################################################
 ARCH := $(shell uname -m)
 
-ifeq ($(ARCH), aarch64)
-    CXX = g++
+HOSTCXX   := /usr/bin/g++-10      # 确保已安装：sudo apt install g++-10
+CXX       := g++-10 
+NVCC      := nvcc
+
+OBJDIR    := objs
+
+CXXFLAGS  := -O3 -Wall -std=c++14 -m64
+NVCCFLAGS := -O3 -m64 -std=c++14 -ccbin g++-10 -Xcompiler -std=c++14
+
+ifeq ($(ARCH),aarch64)
+  # ARM 不加 -m64
 else
-    CXX = g++ -m64
+  CXXFLAGS  += -m64
+  NVCCFLAGS += -m64
 endif
 
-OBJDIR=objs
-CXXFLAGS=-O3 -Wall
-ifeq ($(ARCH), Darwin)
-# Building on mac
-LDFLAGS=-L/usr/local/depot/cuda-8.0/lib/ -lcudart
+LDFLAGS :=
+ifeq ($(ARCH),Darwin)
+  LDFLAGS += -L/usr/local/depot/cuda-8.0/lib/ -lcudart
 else
-# Building on Linux
-LDFLAGS=-L/usr/local/cuda/lib64/ -lcudart
+  LDFLAGS += -L/usr/local/cuda/lib64/ -lcudart
 endif
-NVCC=nvcc
-NVCCFLAGS=-O3 -m64
 
+OBJS := $(OBJDIR)/main.o $(OBJDIR)/saxpy.o
 
-OBJS=$(OBJDIR)/main.o  $(OBJDIR)/saxpy.o
-
-
-.PHONY: dirs clean
-
+.PHONY: dirs clean default
 default: $(EXECUTABLE)
 
 dirs:
-		mkdir -p $(OBJDIR)/
+	@mkdir -p $(OBJDIR)
 
 clean:
-		rm -rf $(OBJDIR) *.ppm *~ $(EXECUTABLE)
+	@rm -rf $(OBJDIR) *.ppm *~ $(EXECUTABLE)
 
 $(EXECUTABLE): dirs $(OBJS)
-		$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
 $(OBJDIR)/%.o: %.cpp
-		$(CXX) $< $(CXXFLAGS) -c -o $@
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(OBJDIR)/%.o: %.cu
-		$(NVCC) $< $(NVCCFLAGS) -c -o $@
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@

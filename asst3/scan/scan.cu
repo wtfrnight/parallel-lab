@@ -27,6 +27,90 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+
+__global__ void exclusive_scan_block(int* __restrict__ array, int* __restrict__ blockSums, int N)
+{
+    extern __shared__ int s[];
+
+    const int tid = threadIdx.x;
+    const int base = blockIdx.x * blockDim.x;
+    const int gid = base + tid;
+
+    if(gid < N)
+    s[tid] = array[gid];
+    else
+    s[tid] = 0;
+    __syncthreads();
+
+    //上扫
+    for(int size = 2; size <= blockDim.x; size<<=1)//size代表区间
+    {
+        int idx = (tid + 1) * size - 1;//块内元素局部索引
+        if(idx < blockDim.x)
+        {
+            s[idx] = s[idx] + s[idx - (size>>1)];
+        }
+        __syncthreads();
+    }
+    if(tid == 0 && blockSums) blockSums[blockIdx.x] = s[blockDim.x -1]; 
+
+    if(tid == 0) s[blockDim.x - 1] = 0;
+    __syncthreads();
+
+    for(int size = blockDim.x; size >=2; size >>= 1)
+    {
+        int idx = (tid + 1) * size - 1;
+        if(idx < blockDim.x)
+        {
+            int t = s[idx - (size >> 1)];
+            s[idx - (size >>1)] = s[idx];
+            s[idx] += t;
+        }
+        __syncthreads();
+    }
+    if(gid < N)
+    array[gid] = s[tid];//写回
+}
+
+__global__ void add_offset_(int* prefix_block, int* blockoffset, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int gid = blockIdx.x;
+    if(idx < N)
+    {
+        prefix_block[idx] = prefix_block[idx] + blockoffset[gid];
+    }
+}
+
+
+
+__global__ void up_scan(int* output, int N, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int index = size * idx + size -1;
+    if(index < N)
+    {
+        output[index] = output[index] + output[index - size / 2];
+    }
+}
+__global__ void set_root_zero(int* output, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx == 0)
+    output[N-1] = 0; 
+}
+__global__ void down_scan(int* output, int N, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int index = (idx + 1) *size -1;
+    if(index < N)
+    {
+        int temp = output[index - size/2];
+        output[index - size/2] = output[index];
+        output[index] = output[index] + temp;
+    }
+}
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -55,7 +139,40 @@ void exclusive_scan(int* input, int N, int* result)
     // scan.
 
 
+    int nbytes = N * sizeof(int);
+    cudaMemcpy(result,input,nbytes,cudaMemcpyDeviceToDevice);
+
+    const int threads = 256;
+    for(int size =2; size <= N; size<<=1)
+    {
+        int pairs = (N + size - 1) / size;//区间数=总线程数
+        int blocks = (pairs + threads - 1) / threads;//blocks数目 
+        up_scan<<<blocks, threads>>>(result,N,size);
+    }
+        set_root_zero<<<1,1>>>(result, N);
+    for(int size = N; size>=2; size>>=1)
+    {
+        int pairs = (N + size -1) /size;
+        int blocks = (pairs + threads -1) / threads;
+        down_scan<<<blocks,threads>>>(result,N,size);
+    }
+
+    // int threads = 256;
+    // int blocks = (N + threads - 1) / threads;
+    // int * blocksSum = nullptr;
+    // cudaMemcpy(result, input, N*sizeof(int), cudaMemcpyDeviceToDevice);
+    // cudaMalloc((void**)& blocksSum, blocks * sizeof(int));//申请内存
+    // exclusive_scan_block<<<blocks, threads, threads * sizeof(int)>>>(result, blocksSum, N);
+    // int sum_blocks = 1;
+    // int sum_threads = nextPow2(blocks / sum_blocks);
+    // exclusive_scan_block<<<sum_blocks, sum_threads, sum_threads * sizeof(int)>>>(blocksSum,nullptr,blocks);
+    // add_offset_<<<blocks, threads>>>(result, blocksSum, N);
+
 }
+
+
+
+
 
 
 //
@@ -139,6 +256,8 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     double overallDuration = endTime - startTime;
     return overallDuration; 
 }
+
+
 
 
 // find_repeats --
