@@ -14,9 +14,52 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+
+
+
+
+//划分TILE
+#define TILE_W  16
+#define TILE_H  16
+#define TILE_PIXELS (TILE_W * TILE_H)
+
+//steup执行初始化部分
+int numTilesX,numTilesY,numTiles;//Tile数量
+int* devTileCircleCount;//每个Tile区域被多少个渲染圆命中
+int* devTileCircleoffset;//在一维的circle-list中的起始偏移量
+int* devTileCircleList;//所有Tile的被命中圆存储的一维存储
+int* devTilesum;
+int  devTileListCap = 0;
+int  devTilesumCap = 0;
+//example
+//2    numTiles     
+//3 3  count
+//0 3  offset
+//3 2 4 6 3 4  circlelist
+//image划分成2个Tiles，第一个Tile 被3个圆命中，在List偏移为0
+//Tile1被3、2、4命中
+// 第二个Tile 被3个圆命中，在List偏移量为3
+//Tile2被6、3、4命中
+
+
+
+
+// helper function to round an integer up to the next power of 2
+static inline int nextPow2(int n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
+
 
 struct GlobalConstants {
 
@@ -324,7 +367,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
+    float rad = cuConstRendererParams.radius[circleIndex];
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
@@ -466,6 +509,10 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
     }
+    if (devTileCircleCount)   cudaFree(devTileCircleCount);
+    if (devTileCircleoffset)  cudaFree(devTileCircleoffset);
+    if (devTileCircleList)    cudaFree(devTileCircleList);
+    if (devTilesum)           cudaFree(devTilesum);
 }
 
 const Image*
@@ -575,6 +622,19 @@ CudaRenderer::setup() {
 
     cudaMemcpyToSymbol(cuConstColorRamp, lookupTable, sizeof(float) * 3 * COLOR_MAP_SIZE);
 
+
+
+    //
+    //
+    //
+    numTilesX = (image->width + TILE_W - 1) / TILE_W;
+    numTilesY = (image->height + TILE_H - 1) / TILE_H;
+    numTiles = numTilesX * numTilesY;
+
+    cudaMalloc(&devTileCircleCount, numTiles * sizeof(int));
+    cudaMalloc(&devTileCircleoffset, numTiles * sizeof(int));
+    devTileCircleList = nullptr;
+
 }
 
 // allocOutputImage --
@@ -633,13 +693,388 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+
+
+
+
+
+
+
+
+__device__ __inline__ int
+circleInBoxConservative(
+    float circleX, float circleY, float circleRadius,
+    float boxL, float boxR, float boxT, float boxB)
+{
+
+    // 将矩形按圆半径向外扩张，然后判断圆心是否落在“扩张后的矩形”内。
+    if ( circleX >= (boxL - circleRadius) &&
+         circleX <= (boxR + circleRadius) &&
+         circleY >= (boxB - circleRadius) &&
+         circleY <= (boxT + circleRadius) ) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+
+__global__ void kernelCountCirclesPerTile(//把每个circle分到Tile里
+    int numCircles,
+    int numTilesX,
+    int numTilesY,
+    int* tileCount
+)
+{  
+    int cid = blockIdx.x * blockDim.x + threadIdx.x;
+    if(cid >= numCircles)//一个线程处理一个circle
+    return;
+
+    //minX/Y和maxX/Y是circle和image的界限
+    int W = cuConstRendererParams.imageWidth;
+    int H = cuConstRendererParams.imageHeight;
+
+    float3 p = *(float3*) (&cuConstRendererParams.position[cid * 3]);
+    float r = cuConstRendererParams.radius[cid];
+
+    int minX = int((p.x - r) * W);//由归一化参数转换成像素坐标
+    int maxX = int((p.x + r) * W + 1);
+    int minY = int((p.y - r) * H);
+    int maxY = int((p.y + r) * H) + 1;
+    minX = max(minX, 0);
+    minY = max(minY, 0);
+    maxX = min(maxX, W);
+    maxY = min(maxY, H);
+    if (minX >= maxX || minY >= maxY) return;
+
+    //当前圆命中的tile的范围
+    int tminX = minX / TILE_W;
+    int tmaxX = (maxX - 1) / TILE_W;
+    int tminY = minY / TILE_H;
+    int tmaxY = (maxY - 1) / TILE_H;
+
+    for (int ty = tminY; ty <= tmaxY; ty++) {//把该圆登记到命中的tile桶里
+        for (int tx = tminX; tx <= tmaxX; tx++) {
+
+            int tileId = ty * numTilesX + tx;
+
+            // 把tile变成0~1的box，供circleInBoxConservative使用
+            float boxL = float(tx * TILE_W)       / W;
+            float boxR = float((tx + 1) * TILE_W) / W;
+            float boxB = float(ty * TILE_H)       / H;
+            float boxT = float((ty + 1) * TILE_H) / H;
+
+            if (circleInBoxConservative(p.x, p.y, r, boxL, boxR, boxT, boxB)) {
+                atomicAdd(&tileCount[tileId], 1);
+            }
+        }
+    }
+
+}
+
+//计算前缀和
+
+__global__ void exclusive_scan_block(int* __restrict__ array, int* __restrict__ blockSums, int N)
+{
+    extern __shared__ int s[];
+
+    const int tid = threadIdx.x;
+    const int base = blockIdx.x * blockDim.x;
+    const int gid = base + tid;
+
+    if(gid < N)
+    s[tid] = array[gid];
+    else
+    s[tid] = 0;
+    __syncthreads();
+
+    //上扫
+    for(int size = 2; size <= blockDim.x; size<<=1)//size代表区间
+    {
+        int idx = (tid + 1) * size - 1;//块内元素局部索引
+        if(idx < blockDim.x)
+        {
+            s[idx] = s[idx] + s[idx - (size>>1)];
+        }
+        __syncthreads();
+    }
+    if(tid == 0 && blockSums) blockSums[blockIdx.x] = s[blockDim.x -1]; 
+
+    if(tid == 0) s[blockDim.x - 1] = 0;
+    __syncthreads();
+
+    for(int size = blockDim.x; size >=2; size >>= 1)
+    {
+        int idx = (tid + 1) * size - 1;
+        if(idx < blockDim.x)
+        {
+            int t = s[idx - (size >> 1)];
+            s[idx - (size >>1)] = s[idx];
+            s[idx] += t;
+        }
+        __syncthreads();
+    }
+    if(gid < N)
+    array[gid] = s[tid];//写回
+}
+
+
+__global__ void add_offset_(int* prefix_block, int* blockoffset, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int gid = blockIdx.x;
+    if(idx < N)
+    {
+        prefix_block[idx] = prefix_block[idx] + blockoffset[gid];
+    }
+}
+
+//填充List列表
+__global__ void kernelFillTileCircleList(
+    int numCircles,
+    int numTilesX, int numTilesY,
+    int* tileCount,
+    const int* tileOffset,
+    int* tileList
+)
+{
+    int cid = blockIdx.x * blockDim.x + threadIdx.x;
+    if(cid >= numCircles) return;
+
+    int W = cuConstRendererParams.imageWidth;
+    int H = cuConstRendererParams.imageHeight;
+
+    float3 p = *(float3*)(&cuConstRendererParams.position[3 * cid]);
+    float  r = cuConstRendererParams.radius[cid];
+
+    int minX = int((p.x - r) * W);
+    int maxX = int((p.x + r) * W) + 1;
+    int minY = int((p.y - r) * H);
+    int maxY = int((p.y + r) * H) + 1;
+
+    minX = max(minX, 0);
+    minY = max(minY, 0);
+    maxX = min(maxX, W);
+    maxY = min(maxY, H);
+
+    if (minX >= maxX || minY >= maxY) return;
+
+    int tminX = minX / TILE_W;
+    int tmaxX = (maxX - 1) / TILE_W;
+    int tminY = minY / TILE_H;
+    int tmaxY = (maxY - 1) / TILE_H;
+
+    for (int ty = tminY; ty <= tmaxY; ty++) {
+        for (int tx = tminX; tx <= tmaxX; tx++) {
+
+            int tileId = ty * numTilesX + tx;
+
+            float boxL = float(tx * TILE_W)       / W;
+            float boxR = float((tx + 1) * TILE_W) / W;
+            float boxB = float(ty * TILE_H)       / H;
+            float boxT = float((ty + 1) * TILE_H) / H;
+
+            if (circleInBoxConservative(p.x, p.y, r, boxL, boxR, boxT, boxB)) {
+                int localIdx = atomicAdd(&tileCount[tileId], 1);
+                int pos = tileOffset[tileId] + localIdx;
+                tileList[pos] = cid;   // 保持 circle 输入顺序
+            }
+        }
+    }
+}
+
+__global__ void kernelRenderTiles(//一个块处理一个tile
+    int numTilesX,
+    int numTilesY,
+    const int* tileOffset,
+    const int* tileCount,
+    int* tileList
+)
+{
+    int tileId = blockIdx.x;
+    int totalTiles = numTilesX * numTilesY;
+    if(tileId >= totalTiles)
+    return;
+
+    int W = cuConstRendererParams.imageWidth;
+    int H = cuConstRendererParams.imageHeight;
+
+    //当前tile在tile网格的坐标
+    int tx = tileId % numTilesX;
+    int ty = tileId / numTilesX;
+
+    //像素起始坐标
+    int pixelX0 = tx * TILE_W;
+    int pixelY0 = ty * TILE_H;
+    
+    //List中存储Tile被命中渲染圆的位置
+    int start = tileOffset[tileId];
+    int count = tileCount[tileId];
+
+    //排序circlenums
+    if(threadIdx.x == 0 && count > 1)
+    {
+        for(int i = 1; i < count; i++){
+            int key = tileList[start + i];
+            int j = i - 1;
+            while(j>=0 && tileList[start + j] > key)
+            {
+                tileList[start + j +1] = tileList[start + j];
+                j--;
+            }
+            tileList[start + j + 1] = key;
+        }
+    }
+
+    __syncthreads();
+
+    
+    //缓存像素值
+    extern __shared__ float4 sTile[];
+
+    //Tile内一维索引
+    int lid = threadIdx.x;
+
+    if(lid >= TILE_PIXELS)
+    return;
+    
+    //Tile内坐标
+    int lx = lid % TILE_W;
+    int ly = lid / TILE_W;
+
+    //全局坐标
+    int gx = pixelX0 + lx;
+    int gy = pixelY0 + ly;
+
+    if(gx < W && gy < H)
+    {
+        //从全局显存imagData缓存像素值
+        sTile[lid] = ((float4*)cuConstRendererParams.imageData)[gy * W + gx];
+    }
+    else
+    {
+        //填充白色
+        sTile[lid] = make_float4(1.f, 1.f, 1.f, 1.f);
+    }
+    
+
+    __syncthreads();
+
+    //----开始渲染
+    //归一化坐标
+    float invW = 1.f / W;
+    float invH = 1.f / H;
+
+    float2 pixelCenter = make_float2(
+        (pixelX0 + lx + 0.5f) * invW,
+        (pixelY0 + ly + 0.5f) * invH
+    );
+
+    for(int i=0; i < count; i++)
+    {
+        int cid = tileList[start + i];//取圆索引
+        float3 p = *(float3*)(&cuConstRendererParams.position[cid * 3]);
+
+        shadePixel(cid, pixelCenter, p, &sTile[lid]);
+    }
+
+    //写回
+    if(gx < W && gy < H)
+    {
+        ((float4*)cuConstRendererParams.imageData)[gy * W + gx] = sTile[lid];
+    }
+
+}
+
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    // // 256 threads per block is a healthy number
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
+    cudaMemset(devTileCircleCount, 0, numTiles * sizeof(int));
+    int threads = 256;
+    int blocks = (numCircles + threads -1) / threads;
+
+    kernelCountCirclesPerTile<<<blocks, threads>>>(
+        numCircles,
+        numTilesX,
+        numTilesY, 
+        devTileCircleCount
+    );
+                                                    
+    blocks = (numTiles + threads - 1) / threads;
+    cudaMemcpy(devTileCircleoffset, devTileCircleCount, numTiles * sizeof(int), cudaMemcpyDeviceToDevice);
+    if(blocks > devTilesumCap)
+    {
+        if(devTilesum)
+        {
+            cudaFree(devTilesum);
+        }
+        cudaMalloc(&devTilesum, blocks * sizeof(int));
+        devTilesumCap = blocks;
+    }
+    
+    exclusive_scan_block<<<blocks, threads, threads * sizeof(int)>>>(
+        devTileCircleoffset,
+        devTilesum,
+        numTiles
+    );
+    int sum_blocks = 1;
+    int sum_threads = nextPow2(blocks / sum_blocks);
+    exclusive_scan_block<<<sum_blocks, sum_threads, sum_threads * sizeof(int)>>>(
+        devTilesum,
+        nullptr,
+        blocks
+    );
+    add_offset_<<<blocks, threads>>>(devTileCircleoffset, devTilesum, numTiles );
+
+    int lastoffset = 0;
+    int lastCount = 0;
+    cudaMemcpy(&lastoffset,
+        devTileCircleoffset + (numTiles - 1),
+        sizeof(int),
+        cudaMemcpyDeviceToHost);
+    cudaMemcpy(&lastCount,
+        devTileCircleCount + (numTiles - 1),
+        sizeof(int),
+        cudaMemcpyDeviceToHost);
+    int totalPairs = lastCount + lastoffset;
+    
+    if(totalPairs > devTileListCap)
+    {
+        if(devTileCircleList)
+        {
+            cudaFree(devTileCircleList);
+        }
+        cudaMalloc(&devTileCircleList, totalPairs * sizeof(int));
+        devTileListCap = totalPairs;
+    }
+    cudaMemset(devTileCircleCount, 0, numTiles * sizeof(int));//重置
+    
+    blocks = (numCircles + threads -1) / threads;
+    kernelFillTileCircleList<<<blocks, threads>>>(
+        numCircles,
+        numTilesX,
+        numTilesY,
+        devTileCircleCount,
+        devTileCircleoffset,
+        devTileCircleList
+    );
+
+    int tileBlocks = numTiles;
+    int tileThreads = TILE_PIXELS;
+    int sharedBytes = TILE_PIXELS * sizeof(float4);
+
+    kernelRenderTiles<<<tileBlocks, tileThreads, sharedBytes>>>(
+        numTilesX,
+        numTilesY,
+        devTileCircleoffset,
+        devTileCircleCount,
+        devTileCircleList
+    );
+
 }

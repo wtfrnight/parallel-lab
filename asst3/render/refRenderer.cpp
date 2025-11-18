@@ -91,6 +91,7 @@ RefRenderer::loadScene(SceneName scene, int seed) {
 //
 // Advance the simulation one time step.  Updates all circle positions
 // and velocities
+//
 void
 RefRenderer::advanceAnimation() {
 
@@ -284,7 +285,7 @@ lookupColor(float coord, float& r, float& g, float& b) {
 // the screen spans [0,1]^2.  The color/opacity of the circle is
 // computed at the pixel center.
 void
-RefRenderer::shadePixel(
+RefRenderer::shadePixel(//参数列表：索引、像素点坐标点x、y、渲染圆坐标x、y、z、颜色RGB数组
     int circleIndex,
     float pixelCenterX, float pixelCenterY,
     float px, float py, float pz,

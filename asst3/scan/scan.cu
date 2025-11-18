@@ -57,6 +57,7 @@ __global__ void exclusive_scan_block(int* __restrict__ array, int* __restrict__ 
     if(tid == 0) s[blockDim.x - 1] = 0;
     __syncthreads();
 
+    //оби╗
     for(int size = blockDim.x; size >=2; size >>= 1)
     {
         int idx = (tid + 1) * size - 1;
@@ -167,7 +168,7 @@ void exclusive_scan(int* input, int N, int* result)
     // int sum_threads = nextPow2(blocks / sum_blocks);
     // exclusive_scan_block<<<sum_blocks, sum_threads, sum_threads * sizeof(int)>>>(blocksSum,nullptr,blocks);
     // add_offset_<<<blocks, threads>>>(result, blocksSum, N);
-
+    // cudaFree(blocksSum);
 }
 
 
